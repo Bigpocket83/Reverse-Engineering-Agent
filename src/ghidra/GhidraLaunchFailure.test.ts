@@ -172,3 +172,51 @@ describe("Ghidra launch failure diagnostics", () => {
     }
   });
 });
+
+describe("Ghidra launch cancellation classification", () => {
+  it("keeps a launcher failure primary when cancellation arrives later", async () => {
+    const runtimeRoot = await mkdtemp(join(tmpdir(), "rea-ghidra-launch-"));
+    try {
+      const controller = new AbortController();
+      const physical = new Error("launch support unreadable");
+      const launcher = new GhidraHeadlessLauncher({
+        environment: {},
+        platform: "darwin",
+        analyzeHeadlessPath: join(runtimeRoot, "support", "analyzeHeadless"),
+        configurationDirectoryName: "ghidra_test_PUBLIC",
+        javaHome: runtimeRoot,
+        bridgeScriptPath: join(runtimeRoot, "bridge", "ReaGhidraBridge.java"),
+        javaLaunch: () => {
+          controller.abort();
+          return Promise.reject(physical);
+        },
+      });
+      const result = await launcher.launch(launchSession(runtimeRoot), {
+        signal: controller.signal,
+      });
+      if (result.ok) throw new Error("Expected launch failure");
+      expect(result.error).toBeInstanceOf(GhidraLaunchError);
+      expect(result.error).toMatchObject({ cancelled: false, cause: physical });
+    } finally {
+      await rm(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reports cancellation when the signal stops the LaunchSupport probe", async () => {
+    const javaHome = await failingJavaHome("#!/bin/sh\nsleep 5\n");
+    const runtimeRoot = await mkdtemp(join(tmpdir(), "rea-ghidra-launch-"));
+    try {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 100);
+      const result = await probeLauncher(javaHome, runtimeRoot).launch(
+        launchSession(runtimeRoot),
+        { signal: controller.signal },
+      );
+      if (result.ok) throw new Error("Expected cancelled launch");
+      expect(result.error).toMatchObject({ _tag: "AnalysisCancelledError" });
+    } finally {
+      await rm(javaHome, { recursive: true, force: true });
+      await rm(runtimeRoot, { recursive: true, force: true });
+    }
+  });
+});
