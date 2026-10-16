@@ -13,6 +13,7 @@ import {
 } from "./webCaptureDiffSchemas.js";
 import type { WebMcpDiscovery } from "./webMcpDiscovery.js";
 import { fingerprintWebCaptureFrames } from "./webCaptureFrameComparison.js";
+import { compareWebCaptureScripts } from "./webCaptureScriptComparison.js";
 
 type Dimension = WebCaptureDimension;
 type Change = WebCaptureChange;
@@ -182,19 +183,7 @@ const compareWebCaptureDimensions = (
   const after = input.after.inspection;
   return {
     dom_structure: domDimension(before, after),
-    scripts: compareDimension(
-      keyed(
-        before.scripts.items.map(scriptProjection),
-        (item) => item.script_key,
-      ),
-      keyed(
-        after.scripts.items.map(scriptProjection),
-        (item) => item.script_key,
-      ),
-      sectionsComplete(before, ["scripts"]) &&
-        sectionsComplete(after, ["scripts"]),
-      "Script inventory was incomplete in at least one observation.",
-    ),
+    scripts: scriptDimension(before, after),
     resources: compareDimension(
       keyed(before.resources, (item) => item.resource_key),
       keyed(after.resources, (item) => item.resource_key),
@@ -215,6 +204,22 @@ const compareWebCaptureDimensions = (
     accessibility: accessibilityDimension(before, after),
     storage: storageDimension(before, after),
   };
+};
+
+const scriptDimension = (
+  before: WebPageInspection,
+  after: WebPageInspection,
+): Dimension => {
+  const inventoryComplete = [before, after].every(
+    (inspection) =>
+      sectionsComplete(inspection, ["scripts"]) &&
+      inspection.scripts.total === inspection.scripts.items.length,
+  );
+  return compareWebCaptureScripts(
+    before.scripts.items,
+    after.scripts.items,
+    inventoryComplete,
+  );
 };
 
 const keyed = <T>(
@@ -810,18 +815,6 @@ const domDimension = (
           "DOM or frame capture was incomplete, or frame ancestry was unresolved in at least one observation.",
       };
 };
-
-const scriptProjection = (
-  script: WebPageInspection["scripts"]["items"][number],
-) => ({
-  script_key: script.script_key,
-  url: script.url,
-  cdp_hash: script.cdp_hash,
-  length: script.length,
-  is_module: script.is_module,
-  language: script.language,
-  source_map_url: script.source_map_url,
-});
 
 const metadataProjection = (inspection: WebPageInspection) => ({
   responses: inspection.metadata.responses
