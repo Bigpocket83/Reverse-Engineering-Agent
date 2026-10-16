@@ -998,3 +998,87 @@ describe("Apple dispatch list scan budget", () => {
     });
   });
 });
+
+describe("malformed Objective-C protocol method lists", () => {
+  it("reports an empty protocol method selector without discarding the protocol or its other methods", () => {
+    const bytes = fixture();
+    bytes.writeUInt32LE(2, 0x804);
+    // The first required method names an empty string; the second is valid.
+    bytes.writeBigUInt64LE(base + 0x930n, 0x808);
+    bytes.writeBigUInt64LE(base + 0x920n, 0x820);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    expect(result.objc_protocols).toMatchObject([
+      {
+        name: "FixtureProtocol",
+        methods: [{ selector: "requiredAction:", is_required: true }],
+        optional_methods: [{ selector: "optionalAction:", is_optional: true }],
+      },
+    ]);
+    expect(result.objc_protocol_records).toMatchObject([
+      {
+        name: "FixtureProtocol",
+        methods: [{ selector: "requiredAction:" }],
+        decode: { status: "partial", reason: "protocol_method_selector_empty" },
+      },
+    ]);
+    expect(result.objc_classes.map(({ name }) => name)).toEqual([
+      "Fixture",
+      "Fixture",
+    ]);
+    expect(result.objc_dispatch_implementations).toMatchObject([
+      { selector: "performAction:" },
+    ]);
+    expect(
+      result.coverage.find(
+        ({ facet }) => facet === "objc_class_method_ivar_metadata",
+      ),
+    ).toMatchObject({
+      status: "partial",
+      reason: expect.stringContaining(
+        "Protocol 0x100000740: Objective-C protocol FixtureProtocol required instance method 0 at 0x100000808 has an empty selector",
+      ),
+    });
+  });
+});
+
+describe("malformed Objective-C category class references", () => {
+  it("keeps a category whose local class has an empty name", () => {
+    const bytes = fixture(false, "unmapped-class");
+    // The category names a mapped local class whose class_ro_t name is empty.
+    bytes.writeBigUInt64LE(base + 0xc00n, 0xb48);
+    bytes.writeBigUInt64LE(base + 0xc40n, 0xc20);
+    bytes.writeBigUInt64LE(base + 0xcf0n, 0xc58);
+    const result = decodeAppleDispatchMetadata(bytes, 100, provenance);
+    expect(result.objc_categories).toMatchObject([
+      {
+        name: "FixtureCategory",
+        class_name: null,
+        class_source: "unresolved",
+        decode: { status: "partial", reason: "category_class_unresolved" },
+      },
+    ]);
+    expect(result.objc_categories[0]?.instance_methods).toEqual([
+      "performAction:",
+    ]);
+    expect(result.objc_dispatch_implementations).toContainEqual(
+      expect.objectContaining({
+        category: "FixtureCategory",
+        class_name: "(FixtureCategory)",
+      }),
+    );
+    expect(result.objc_classes.map(({ name }) => name)).toEqual([
+      "Fixture",
+      "Fixture",
+    ]);
+    expect(
+      result.coverage.find(
+        ({ facet }) => facet === "objc_properties_categories",
+      ),
+    ).toMatchObject({
+      status: "partial",
+      reason: expect.stringContaining(
+        "Category FixtureCategory class reference 0x100000c00: Objective-C class has an empty name",
+      ),
+    });
+  });
+});
