@@ -2,13 +2,25 @@ import { readFile } from "node:fs/promises";
 import { AnalysisCapabilityUnavailableError } from "../domain/analysisErrorCore.js";
 
 import { launcherIdentityFailure } from "./ProcessOwnershipIdentity.js";
-import { descendantsOf, liveProcesses } from "./ProcessOwnershipProcessTree.js";
+import {
+  descendantsOf,
+  liveProcesses,
+  readLiveProcessTable,
+} from "./ProcessOwnershipProcessTree.js";
 import { execFileOutput } from "./ExecFileOutput.js";
 import {
   createDarwinProcessRunTokenReader,
   type DarwinProcessReaderCompiler,
 } from "./DarwinProcessRunTokenReader.js";
-import { readProcessRunTokens } from "./ProcessRunTokenObservations.js";
+import {
+  classifyProcessRunToken,
+  readProcessRunTokens,
+} from "./ProcessRunTokenObservations.js";
+import {
+  environmentWithheldFromInspection,
+  readProcessOwnershipCandidates,
+  refreshedProcessCandidates,
+} from "./ProcessOwnershipRefresh.js";
 import type {
   OwnedProcessGroup,
   ProcessGroupObservation,
@@ -29,67 +41,77 @@ export const observeOwnedProcessGroups = async (
   signal?.throwIfAborted();
   const groupIds = [...new Set(processGroupIds)];
   if (groupIds.length === 0) return new Map();
-  let processes: readonly ProcessTableEntry[];
-  try {
-    processes = liveProcesses(await host.listProcesses(signal));
-  } catch (cause: unknown) {
-    signal?.throwIfAborted();
+  let table = await readLiveProcessTable(host, signal);
+  if (!table.available) {
     const failure = {
       state: "unverifiable" as const,
-      reason: `process group could not be inspected: ${errorMessage(cause)}`,
+      reason: `process group could not be inspected: ${table.reason}`,
     };
     return new Map(groupIds.map((groupId) => [groupId, failure]));
   }
-  signal?.throwIfAborted();
-  const membersByGroup = new Map(
-    groupIds.map((groupId) => [groupId, [] as ProcessTableEntry[]]),
-  );
-  for (const process of processes)
-    membersByGroup.get(process.processGroupId)?.push(process);
-  const observations = new Map<number, ProcessGroupObservation>(
-    groupIds.map((groupId) => [
-      groupId,
-      (membersByGroup.get(groupId)?.length ?? 0) > 0
-        ? { state: "alive" }
-        : { state: "empty" },
-    ]),
-  );
-  const liveMembers = groupIds.flatMap(
-    (groupId) => membersByGroup.get(groupId) ?? [],
-  );
-  const pendingGroups = new Set(
-    groupIds.filter(
-      (groupId) => (membersByGroup.get(groupId)?.length ?? 0) > 0,
-    ),
-  );
-  for await (const { process: member, observation } of readProcessRunTokens(
-    host,
-    liveMembers,
-    signal,
-  )) {
-    if (!pendingGroups.has(member.processGroupId)) continue;
-    if (observation.state === "readable") {
-      if (observation.runId !== runId) {
+  const observations = new Map<number, ProcessGroupObservation>();
+  const pendingGroups = new Set(groupIds);
+  for (let attempt = 0; attempt < OWNERSHIP_OBSERVATION_ATTEMPTS; attempt++) {
+    const members = table.processes.filter(({ processGroupId }) =>
+      pendingGroups.has(processGroupId),
+    );
+    for (const groupId of pendingGroups)
+      observations.set(
+        groupId,
+        members.some(({ processGroupId }) => processGroupId === groupId)
+          ? { state: "alive" }
+          : { state: "empty" },
+      );
+    const unavailable: {
+      readonly process: ProcessTableEntry;
+      readonly reason: string;
+    }[] = [];
+    for await (const { process: member, observation } of readProcessRunTokens(
+      host,
+      members,
+      signal,
+    )) {
+      if (!pendingGroups.has(member.processGroupId)) continue;
+      const validation = classifyProcessRunToken(observation, runId);
+      if (validation.state === "foreign") {
         observations.set(member.processGroupId, {
           state: "unverifiable",
           reason: "process ownership did not match",
         });
         pendingGroups.delete(member.processGroupId);
+      } else if (validation.state === "unavailable") {
+        unavailable.push({ process: member, reason: validation.reason });
       }
-    } else {
-      const gone = await processIsGone(host, member.pid);
-      signal?.throwIfAborted();
-      if (!gone) {
-        observations.set(member.processGroupId, {
-          state: "unverifiable",
-          reason: `process ownership could not be revalidated for PID ${member.pid}: ${observation.reason}`,
-        });
-        pendingGroups.delete(member.processGroupId);
-      }
+      if (pendingGroups.size === 0) break;
     }
-    if (pendingGroups.size === 0) break;
+    signal?.throwIfAborted();
+    if (unavailable.length === 0 || pendingGroups.size === 0)
+      return observations;
+    const refreshed = await readLiveProcessTable(host, signal);
+    for (const { process: member, reason } of unavailable) {
+      if (!pendingGroups.has(member.processGroupId)) continue;
+      if (
+        refreshed.available &&
+        !refreshed.processes.some(({ pid }) => pid === member.pid)
+      )
+        continue;
+      observations.set(member.processGroupId, {
+        state: "unverifiable",
+        reason: `process ownership could not be revalidated for PID ${member.pid}: ${reason}${refreshed.available ? "" : `; process table could not be inspected: ${refreshed.reason}`}`,
+      });
+      pendingGroups.delete(member.processGroupId);
+    }
+    if (!refreshed.available || pendingGroups.size === 0) return observations;
+    table = refreshed;
+    // Exit proof settles only the old PID. The complete refreshed membership
+    // still needs token validation before the remaining groups can be verified.
   }
-  signal?.throwIfAborted();
+  for (const groupId of pendingGroups)
+    observations.set(groupId, {
+      state: "unverifiable",
+      reason:
+        "process-group membership kept changing during bounded ownership observation",
+    });
   return observations;
 };
 
@@ -104,67 +126,118 @@ export const observeOwnedProcessLineage = async (
   ownership: OwnedProcessGroup,
   host: ProcessOwnershipHost = systemProcessOwnershipHost,
 ): Promise<ProcessLineageObservation> => {
-  let processes: readonly ProcessTableEntry[];
-  try {
-    processes = liveProcesses(await host.listProcesses());
-  } catch (cause: unknown) {
+  let table = await readLiveProcessTable(host);
+  if (!table.available) {
     return unavailableLineage(
       ownership,
-      `process table could not be inspected: ${errorMessage(cause)}`,
+      `process table could not be inspected: ${table.reason}`,
     );
   }
-  const launcher = processes.find(({ pid }) => pid === ownership.leaderPid);
-  if (launcher === undefined)
-    return unavailableLineage(ownership, "owned launcher is not live");
-  const identityFailure = launcherIdentityFailure(launcher, ownership);
-  if (identityFailure !== null)
-    return unavailableLineage(ownership, identityFailure);
-  const descendants = descendantsOf([launcher.pid], processes);
-  const verifiedDescendants: ProcessTableEntry[] = [];
-  for await (const { process: member, observation } of readProcessRunTokens(
-    host,
-    [launcher, ...descendants],
-  )) {
-    if (observation.state === "readable") {
-      if (observation.runId !== ownership.runId)
-        return unavailableLineage(
-          ownership,
-          "process lineage contains an unowned or PID-reused process",
-        );
-      if (member.pid !== launcher.pid) verifiedDescendants.push(member);
-    } else {
-      if (await processIsGone(host, member.pid)) {
+  const descendantAnchors = new Set<number>([ownership.leaderPid]);
+  const discoveredIdentities = new Map<number, string | null>();
+  let previousProcesses: readonly ProcessTableEntry[] | undefined;
+  for (let attempt = 0; attempt < OWNERSHIP_OBSERVATION_ATTEMPTS; attempt++) {
+    const processes = table.processes;
+    const launcher = processes.find(({ pid }) => pid === ownership.leaderPid);
+    if (launcher === undefined)
+      return unavailableLineage(ownership, "owned launcher is not live");
+    const identityFailure = launcherIdentityFailure(launcher, ownership);
+    if (identityFailure !== null)
+      return unavailableLineage(ownership, identityFailure);
+    const discovered = new Set(
+      descendantsOf([...descendantAnchors], processes).map(({ pid }) => pid),
+    );
+    const descendants = processes.filter(
+      ({ pid }) =>
+        pid !== launcher.pid &&
+        (descendantAnchors.has(pid) || discovered.has(pid)),
+    );
+    for (const { pid } of descendants) descendantAnchors.add(pid);
+    const linkedPids = new Set([
+      launcher.pid,
+      ...descendants.map(({ pid }) => pid),
+    ]);
+    const unlinked =
+      previousProcesses === undefined
+        ? []
+        : refreshedProcessCandidates(previousProcesses, processes).filter(
+            ({ pid }) => !linkedPids.has(pid),
+          );
+    const verifiedDescendants: ProcessTableEntry[] = [];
+    const inspection = await readProcessOwnershipCandidates(
+      [launcher, ...descendants, ...unlinked],
+      ownership.runId,
+      host,
+      discoveredIdentities,
+    );
+    if (inspection.failure !== undefined)
+      return unavailableLineage(ownership, inspection.failure);
+    for (const {
+      process: member,
+      ownership: validation,
+    } of inspection.observations) {
+      if (validation.state === "foreign") {
+        if (linkedPids.has(member.pid))
+          return unavailableLineage(
+            ownership,
+            "process lineage contains an unowned or PID-reused process",
+          );
+        continue;
+      }
+      if (validation.state === "owned") {
+        if (!discoveredIdentities.has(member.pid))
+          discoveredIdentities.set(member.pid, validation.identity);
+        descendantAnchors.add(member.pid);
+        if (member.pid !== launcher.pid) verifiedDescendants.push(member);
+      } else if (validation.state === "exited") {
         if (member.pid === launcher.pid)
           return unavailableLineage(
             ownership,
             "owned launcher exited during lineage validation",
           );
-        continue;
+      } else {
+        if (
+          !linkedPids.has(member.pid) &&
+          validation.reason === "environment-unreadable" &&
+          environmentWithheldFromInspection(member, validation.diagnostic)
+        )
+          continue;
+        return unavailableLineage(
+          ownership,
+          `process ownership could not be revalidated for PID ${String(member.pid)}: ${validation.diagnostic}`,
+        );
       }
-      return unavailableLineage(
-        ownership,
-        `process ownership could not be revalidated for PID ${member.pid}: ${observation.reason}`,
-      );
     }
+    if (inspection.refreshedProcesses !== undefined) {
+      previousProcesses = processes;
+      table = { available: true, processes: inspection.refreshedProcesses };
+      continue;
+    }
+    return {
+      status: "verified",
+      observedAt: new Date().toISOString(),
+      lineage: {
+        runId: ownership.runId,
+        launcherPid: launcher.pid,
+        launcherParentPid: launcher.parentPid,
+        processGroupId: launcher.processGroupId,
+        descendants: verifiedDescendants
+          .sort((left, right) => left.pid - right.pid)
+          .map(({ pid, parentPid, processGroupId }) => ({
+            pid,
+            parentPid,
+            processGroupId,
+          })),
+      },
+    };
   }
-  return {
-    status: "verified",
-    observedAt: new Date().toISOString(),
-    lineage: {
-      runId: ownership.runId,
-      launcherPid: launcher.pid,
-      launcherParentPid: launcher.parentPid,
-      processGroupId: launcher.processGroupId,
-      descendants: verifiedDescendants
-        .sort((left, right) => left.pid - right.pid)
-        .map(({ pid, parentPid, processGroupId }) => ({
-          pid,
-          parentPid,
-          processGroupId,
-        })),
-    },
-  };
+  return unavailableLineage(
+    ownership,
+    "process lineage kept changing during bounded ownership observation",
+  );
 };
+
+const OWNERSHIP_OBSERVATION_ATTEMPTS = 3;
 
 const unavailableLineage = (
   ownership: OwnedProcessGroup,
@@ -256,25 +329,38 @@ export const createSystemProcessOwnershipHost = (
       : undefined;
   const listProcesses = async (signal?: AbortSignal) => {
     if (platform === "win32") return [];
-    const { stdout } = await execFileOutput(
+    const { stdout, processId } = await execFileOutput(
       "ps",
       ["-axo", "pid=,ppid=,pgid=,uid=,stat=,command="],
-      { env: hostEnvironment, ...(signal === undefined ? {} : { signal }) },
+      {
+        env: hostEnvironment,
+        captureProcessId: true,
+        ...(signal === undefined ? {} : { signal }),
+      },
     );
-    return stdout
-      .split("\n")
-      .map((line) =>
-        /\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)/u.exec(line),
-      )
-      .filter((match): match is RegExpExecArray => match !== null)
-      .map((match) => ({
-        pid: Number(match[1]),
-        parentPid: Number(match[2]),
-        processGroupId: Number(match[3]),
-        uid: Number(match[4]),
-        state: match[5] ?? "",
-        command: match[6] ?? "",
-      }));
+    return (
+      stdout
+        .split("\n")
+        .map((line) =>
+          /\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)/u.exec(line),
+        )
+        .filter((match): match is RegExpExecArray => match !== null)
+        .map((match) => ({
+          pid: Number(match[1]),
+          parentPid: Number(match[2]),
+          processGroupId: Number(match[3]),
+          uid: Number(match[4]),
+          state: match[5] ?? "",
+          command: match[6] ?? "",
+        }))
+        // ps produced this row while its own invocation was alive. Exclude only
+        // that collector from its snapshot, without guessing by command names or
+        // treating its PID as current ownership after the invocation exits.
+        .filter(
+          ({ pid, parentPid }) =>
+            pid !== processId || parentPid !== process.pid,
+        )
+    );
   };
   const processIdentities: NonNullable<
     ProcessOwnershipHost["processIdentities"]
@@ -554,21 +640,6 @@ export const prepareProcessOwnershipInspection = async (
   signal?: AbortSignal,
 ): Promise<void> => {
   await systemProcessOwnershipHost.prepare?.(signal);
-};
-
-const processIsGone = async (
-  host: ProcessOwnershipHost,
-  pid: number,
-): Promise<boolean> => {
-  try {
-    return !liveProcesses(await host.listProcesses()).some(
-      (process) => process.pid === pid,
-    );
-  } catch (cause: unknown) {
-    // best-effort cleanup: optional liveness probing; failure means not gone.
-    void cause;
-    return false;
-  }
 };
 
 export const errorMessage = (cause: unknown): string =>
