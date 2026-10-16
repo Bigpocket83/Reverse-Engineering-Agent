@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  appendFile,
   mkdtemp,
   readFile,
   realpath,
@@ -10,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { holdFirstFileRead } from "../../tests/support/holdFirstFileRead.js";
 import { parseConfig } from "../config/parseConfig.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
@@ -123,6 +125,22 @@ describe("Ghidra seed commitment", () => {
     await expect(
       snapshotGhidraAnalysisSeeds(resolved.value, await workspace()),
     ).rejects.toThrow(/changed after the analysis profile was committed/u);
+  });
+
+  it("refuses a seed file that grows during its read", async () => {
+    const directory = await workspace();
+    const path = join(directory, "seeds.tsv");
+    await writeFile(path, "0x401000\tcode\n");
+    const reads = await holdFirstFileRead(path);
+    const resolving = resolveGhidraAnalysisSeeds(path);
+    await reads.firstRead;
+    await appendFile(path, "0x402000\tcode\n");
+    reads.release();
+    const result = await resolving;
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.diagnostics?.reason).toMatch(/changed during read/u);
+    }
   });
 
   it("commits the resolved path behind a configured symbolic link", async () => {

@@ -156,6 +156,13 @@ const readSeedFile = async (path: string): Promise<Buffer> => {
         throw new Error(`Incomplete Ghidra seed file read: ${path}`);
       offset += read.bytesRead;
     }
+    const extra = Buffer.alloc(1);
+    const postStat = await file.stat();
+    if (
+      (await file.read(extra, 0, 1, offset)).bytesRead !== 0 ||
+      postStat.size !== stat.size
+    )
+      throw new Error(`Ghidra seed file changed during read: ${path}`);
     return bytes;
   } finally {
     await file.close();
